@@ -208,10 +208,15 @@ def selenium_crawl(driver, url, visited, base_domain, max_depth=3, depth=0):
     visited.add(url)
     print(f"Crawling: {url} (Depth: {depth})")
     try:
+        # Add page load timeout to prevent hanging
+        driver.set_page_load_timeout(10)
         driver.get(url)
         time.sleep(3)
+    except KeyboardInterrupt:
+        print("\n[!] Crawling interrupted by user. Continuing with collected URLs...")
+        return []
     except Exception as e:
-        print(f"Error loading {url}: {e}")
+        print(f"[-] Error loading {url}: {e}")
         return []
     
     html = driver.page_source
@@ -813,81 +818,90 @@ def main():
     
     print("\n[*] Starting dynamic crawl...")
     visited = set()
-    discovered_urls = selenium_crawl(driver, target_url, visited, base_domain, max_depth=3)
-    print(f"[+] Found {len(discovered_urls)} internal URLs")
     
-    # Find potential SSRF endpoints
-    ssrf_candidates = find_ssrf_candidates(discovered_urls)
-    print(f"[*] Testing {len(ssrf_candidates)} potential SSRF endpoints")
-    
-    # Test each candidate URL for SSRF vulnerabilities
-    ssrf_results = {}
-    total = len(ssrf_candidates)
-    
-    for i, candidate in enumerate(ssrf_candidates, 1):
-        try:
-            # Create progress bar
-            progress = int((i / total) * 50)  # 50 is the width of the progress bar
-            bar = '=' * progress + '-' * (50 - progress)
-            percentage = (i / total) * 100
-            
-            # Print progress bar
-            print(f'\r[{bar}] {percentage:.1f}% ({i}/{total}) Testing: {candidate[:30]}...', end='')
-            
-            test_results = test_ssrf(candidate, ml_model)
-            ssrf_results[candidate] = test_results
-        except Exception as e:
-            print(f"\n[-] Error testing {candidate}: {str(e)}")
-            ssrf_results[candidate] = {"error": str(e)}
-    
-    print("\n")  # New line after progress bar completes
-    
-    # Analyze results to find vulnerabilities
-    vulnerability_report = analyze_ssrf_results(ssrf_results)
-    
-    # Save detailed results to JSON
-    with open("ssrf_results.json", "w") as f:
-        json.dump(ssrf_results, f, indent=2)
+    try:
+        discovered_urls = selenium_crawl(driver, target_url, visited, base_domain, max_depth=3)
+        print(f"[+] Found {len(discovered_urls)} internal URLs")
         
-    # Also save to CSV for spreadsheet analysis
-    save_results_to_csv(vulnerability_report)
-    
-    # Print summary
-    print("\n===== SSRF Scan Results =====")
-    print(f"Total URLs scanned: {len(discovered_urls)}")
-    print(f"Potential SSRF endpoints tested: {len(ssrf_candidates)}")
-    print(f"Confirmed vulnerable endpoints: {len(vulnerability_report['vulnerable_endpoints'])}")
-    print(f"Potential vulnerable endpoints: {len(vulnerability_report['potential_endpoints'])}")
-    
-    # Print discovered vulnerabilities
-    if vulnerability_report["vulnerable_endpoints"]:
-        print("\n[!] SSRF VULNERABILITIES FOUND:")
-        for endpoint in vulnerability_report["vulnerable_endpoints"]:
-            print(f"\n[!] Vulnerable URL: {endpoint['url']}")
-            for pred in endpoint["predictions"]:
-                print(f"    - Attack Type: {pred['attack_type']}")
-                print(f"    - CWE: {pred.get('cwe_id', 918)} ({pred.get('cwe_name', 'Server-Side Request Forgery')})")
-                print(f"    - Confidence: {pred['confidence']:.2f}")
-                print(f"    - Payload: {pred['payload']}")
-                print(f"    - Mitigation: {pred['mitigation']}")
-    
-    if vulnerability_report["potential_endpoints"]:
-        print("\n[?] Potential SSRF vulnerabilities (needs verification):")
-        for endpoint in vulnerability_report["potential_endpoints"]:
-            print(f"    * {endpoint['url']}")
-            # Show top prediction for context
-            if endpoint["predictions"]:
-                top_pred = endpoint["predictions"][0]
-                print(f"      - Most likely: {top_pred['attack_type']} (CWE-{top_pred.get('cwe_id', 918)})")
-                print(f"      - Confidence: {top_pred['confidence']:.2f}")
-                print(f"      - Try payload: {top_pred['payload']}")
-                print(f"      - Mitigation: {top_pred['mitigation']}")
-    
-    if not vulnerability_report["vulnerable_endpoints"] and not vulnerability_report["potential_endpoints"]:
-        print("\n[+] No SSRF vulnerabilities detected")
-    
-    print(f"\n[+] Scan completed. Results saved to ssrf_results.json and ssrf_results.csv")
-    driver.quit()
+        # Find potential SSRF endpoints
+        ssrf_candidates = find_ssrf_candidates(discovered_urls)
+        print(f"[*] Testing {len(ssrf_candidates)} potential SSRF endpoints")
+        
+        # Test each candidate URL for SSRF vulnerabilities
+        ssrf_results = {}
+        total = len(ssrf_candidates)
+        
+        for i, candidate in enumerate(ssrf_candidates, 1):
+            try:
+                # Create progress bar
+                progress = int((i / total) * 50)  # 50 is the width of the progress bar
+                bar = '=' * progress + '-' * (50 - progress)
+                percentage = (i / total) * 100
+                
+                # Print progress bar
+                print(f'\r[{bar}] {percentage:.1f}% ({i}/{total}) Testing: {candidate[:30]}...', end='')
+                
+                test_results = test_ssrf(candidate, ml_model)
+                ssrf_results[candidate] = test_results
+            except Exception as e:
+                print(f"\n[-] Error testing {candidate}: {str(e)}")
+                ssrf_results[candidate] = {"error": str(e)}
+        
+        print("\n")  # New line after progress bar completes
+        
+        # Analyze results to find vulnerabilities
+        vulnerability_report = analyze_ssrf_results(ssrf_results)
+        
+        # Save detailed results to JSON
+        with open("ssrf_results.json", "w") as f:
+            json.dump(ssrf_results, f, indent=2)
+        
+        # Also save to CSV for spreadsheet analysis
+        save_results_to_csv(vulnerability_report)
+        
+        # Print summary
+        print("\n===== SSRF Scan Results =====")
+        print(f"Total URLs scanned: {len(discovered_urls)}")
+        print(f"Potential SSRF endpoints tested: {len(ssrf_candidates)}")
+        print(f"Confirmed vulnerable endpoints: {len(vulnerability_report['vulnerable_endpoints'])}")
+        print(f"Potential vulnerable endpoints: {len(vulnerability_report['potential_endpoints'])}")
+        
+        # Print discovered vulnerabilities
+        if vulnerability_report["vulnerable_endpoints"]:
+            print("\n[!] SSRF VULNERABILITIES FOUND:")
+            for endpoint in vulnerability_report["vulnerable_endpoints"]:
+                print(f"\n[!] Vulnerable URL: {endpoint['url']}")
+                for pred in endpoint["predictions"]:
+                    print(f"    - Attack Type: {pred['attack_type']}")
+                    print(f"    - CWE: {pred.get('cwe_id', 918)} ({pred.get('cwe_name', 'Server-Side Request Forgery')})")
+                    print(f"    - Confidence: {pred['confidence']:.2f}")
+                    print(f"    - Payload: {pred['payload']}")
+                    print(f"    - Mitigation: {pred['mitigation']}")
+        
+        if vulnerability_report["potential_endpoints"]:
+            print("\n[?] Potential SSRF vulnerabilities (needs verification):")
+            for endpoint in vulnerability_report["potential_endpoints"]:
+                print(f"    * {endpoint['url']}")
+                # Show top prediction for context
+                if endpoint["predictions"]:
+                    top_pred = endpoint["predictions"][0]
+                    print(f"      - Most likely: {top_pred['attack_type']} (CWE-{top_pred.get('cwe_id', 918)})")
+                    print(f"      - Confidence: {top_pred['confidence']:.2f}")
+                    print(f"      - Try payload: {top_pred['payload']}")
+                    print(f"      - Mitigation: {top_pred['mitigation']}")
+        
+        if not vulnerability_report["vulnerable_endpoints"] and not vulnerability_report["potential_endpoints"]:
+            print("\n[+] No SSRF vulnerabilities detected")
+        
+        print(f"\n[+] Scan completed. Results saved to ssrf_results.json and ssrf_results.csv")
+    except KeyboardInterrupt:
+        print("\n[!] Scan interrupted by user. Exiting...")
+        driver.quit()
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n[-] An error occurred: {e}")
+        driver.quit()
+        sys.exit(1)
 
 if __name__ == '__main__':
     warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
