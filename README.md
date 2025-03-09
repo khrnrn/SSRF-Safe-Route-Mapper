@@ -45,7 +45,9 @@ You'll need to install:
 
 
 ## How to Use
-Download ssrf-safe-route-mapper folder.
+Download `ssrf-safe-route-mapper` folder under `main` branch.
+
+Then, run the following command:
 
 ```
 python app.py
