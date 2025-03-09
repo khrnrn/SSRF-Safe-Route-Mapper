@@ -1,5 +1,5 @@
 # SSRF Safe Route Mapper
-Web Security Project
+SSRF Safe Route Mapper is an advanced security tool designed to detect, visualize, and mitigate Server-Side Request Forgery (SSRF) vulnerabilities in web applications. SSRF is a critical security issue that can expose sensitive internal resources and lead to unauthorized access.
 
 ## Setup
 You'll need to install:
