@@ -8,9 +8,11 @@ You'll need to install:
 
 2. Python Libraries (Install via pip)
 
-Run:
+   Run:
 
-```pip install flask requests beautifulsoup4 selenium numpy pickle pandas matplotlib seaborn scikit-learn xgboost```
+   ```
+   pip install flask requests beautifulsoup4 selenium numpy pickle pandas matplotlib seaborn scikit-learn xgboost
+   ```
    - flask
    - requests
    - beautifulsoup4
@@ -24,14 +26,31 @@ Run:
 
 3. Chromedriver (For Selenium)
 
-Install it via:
+   Install it via:
 
-```sudo apt install chromium-chromedriver  # For Linux```
+   ### Linux
 
-```brew install chromedriver  # For macOS```
+   ```
+   sudo apt install chromium-chromedriver
+   ```
+
+   ### macOS
+
+   ```
+   brew install chromedriver
+   ```
 
 
-Or manually download from: https://chromedriver.chromium.org/downloads
+   Or manually download from: https://sites.google.com/chromium.org/driver/downloads
+
+
+## How to Use
+Download ssrf-safe-route-mapper folder.
+
+```
+python app.py
+```
+
 
 Final Submission should include these in our GitHub: 
 - Codes
