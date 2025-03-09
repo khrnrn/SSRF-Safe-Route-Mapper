@@ -50,10 +50,3 @@ Download ssrf-safe-route-mapper folder.
 ```
 python app.py
 ```
-
-
-Final Submission should include these in our GitHub: 
-- Codes
-- Binaries
-- readme.txt
-- User Manual
